@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+.venv/
+*.docx.tmp
+rapport_audit_ivsa.docx
+*.ndjson

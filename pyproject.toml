@@ -5,11 +5,10 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ivsa"
 version = "1.0.0"
-description = "Ilexia Validation & Security Automator - audit de conformité et de sécurité des Trunks SIP ToIP"
+description = "Interop Validation & Security Automator - audit de conformité et de sécurité des Trunks SIP ToIP"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Proprietary" }
-authors = [{ name = "ILEXIA" }]
 dependencies = [
     "pyshark>=0.6,<0.7",
     "scapy>=2.7,<3.0",
