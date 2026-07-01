@@ -1,0 +1,45 @@
+from __future__ import annotations
+
+from ivsa import cli
+from tests.conftest import requires_tshark
+
+
+@requires_tshark
+def test_cli_generates_report_and_returns_zero_without_strict(full_scenario_pcap, tmp_path):
+    output_path = tmp_path / "rapport.docx"
+    ecs_path = tmp_path / "events.ndjson"
+
+    exit_code = cli.main(
+        [
+            "--pcap",
+            str(full_scenario_pcap),
+            "--output",
+            str(output_path),
+            "--ecs-output",
+            str(ecs_path),
+        ]
+    )
+
+    assert exit_code == 0
+    assert output_path.is_file()
+    assert ecs_path.is_file()
+    assert len(ecs_path.read_text(encoding="utf-8").strip().splitlines()) > 0
+
+
+@requires_tshark
+def test_cli_strict_mode_returns_non_zero_when_failures_present(full_scenario_pcap, tmp_path):
+    output_path = tmp_path / "rapport.docx"
+
+    exit_code = cli.main(
+        ["--pcap", str(full_scenario_pcap), "--output", str(output_path), "--strict"]
+    )
+
+    assert exit_code == 2
+    assert output_path.is_file()
+
+
+def test_cli_returns_one_for_missing_pcap(tmp_path, capsys):
+    output_path = tmp_path / "rapport.docx"
+    exit_code = cli.main(["--pcap", str(tmp_path / "missing.pcapng"), "--output", str(output_path)])
+    assert exit_code == 1
+    assert not output_path.exists()

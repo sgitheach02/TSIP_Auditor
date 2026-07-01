@@ -1,0 +1,203 @@
+"""Point d'entrée en ligne de commande de IVSA.
+
+Orchestre l'ensemble de la chaîne d'audit : parsing de la capture réseau
+(`core.parser`), application du référentiel de règles (`core.rules_engine`),
+export SIEM optionnel (`core.ecs_formatter`) et génération du rapport Word
+final (`core.reporter`).
+
+Exemple d'utilisation :
+
+    python -m ivsa.cli --pcap capture_trunk_sfr.pcapng \\
+        --client "Client Démo SA" --site "Siège Paris" \\
+        --ipbx-vendor Asterisk --ipbx-version 22.1.0 \\
+        --operator SFR --trunk-type "OTT SIP" \\
+        --sbc-sip-ip 80.118.100.128 --sbc-rtp-ip 80.118.100.128 \\
+        --output rapport_audit.docx --ecs-output anomalies.ndjson
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+from pathlib import Path
+
+from ivsa.core.ecs_formatter import export_ndjson
+from ivsa.core.exceptions import IvsaError
+from ivsa.core.models import AnalysisMetadata, AnalysisResult, NetworkEndpoint
+from ivsa.core.parser import PcapAnalyzer
+from ivsa.core.reporter import DEFAULT_TEMPLATE_PATH, ReportBuilder
+from ivsa.core.rules_engine import RulesConfig, RuleEngine
+
+_DEFAULT_RULES_PATH = Path(__file__).resolve().parent / "config" / "rules.yaml"
+_DEFAULT_OUTPUT_PATH = Path("rapport_audit_ivsa.docx")
+
+logger = logging.getLogger("ivsa")
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="ivsa",
+        description=(
+            "IVSA - Ilexia Validation & Security Automator. Audite une capture réseau "
+            "(.pcapng) d'un Trunk SIP ToIP et génère un rapport Word de conformité et de sécurité."
+        ),
+    )
+    parser.add_argument("--pcap", required=True, type=Path, help="Chemin de la capture .pcapng à analyser.")
+    parser.add_argument(
+        "--rules", type=Path, default=_DEFAULT_RULES_PATH, help="Chemin du référentiel de règles YAML."
+    )
+    parser.add_argument(
+        "--template",
+        type=Path,
+        default=DEFAULT_TEMPLATE_PATH,
+        help="Chemin du gabarit Word (.docx) du rapport.",
+    )
+    parser.add_argument(
+        "--output", type=Path, default=_DEFAULT_OUTPUT_PATH, help="Chemin du rapport Word à générer."
+    )
+    parser.add_argument(
+        "--ecs-output",
+        type=Path,
+        default=None,
+        help="Chemin d'export NDJSON des événements ECS (Logstash/PFELK). Non exporté si omis.",
+    )
+
+    metadata_group = parser.add_argument_group("Métadonnées du rapport")
+    metadata_group.add_argument("--client", default=None, help="Nom du client audité.")
+    metadata_group.add_argument("--site", default=None, help="Nom ou identifiant du site audité.")
+    metadata_group.add_argument("--analyst", default="IVSA", help="Nom de l'auditeur réseau.")
+    metadata_group.add_argument("--ipbx-vendor", default=None, help="Éditeur/constructeur de l'IPBX.")
+    metadata_group.add_argument("--ipbx-version", default=None, help="Version de l'IPBX.")
+    metadata_group.add_argument("--operator", default=None, help="Opérateur du Trunk SIP.")
+    metadata_group.add_argument("--trunk-type", default=None, help="Type de Trunk (ex : OTT SIP, SIP-TLS).")
+
+    nat_group = parser.add_argument_group("Matrice NAT (facultatif)")
+    nat_group.add_argument(
+        "--sbc-sip-ip",
+        action="append",
+        default=None,
+        help="Adresse IP du SBC opérateur pour la signalisation SIP (répétable).",
+    )
+    nat_group.add_argument(
+        "--sbc-rtp-ip",
+        action="append",
+        default=None,
+        help="Adresse IP du SBC opérateur pour les flux média RTP (répétable).",
+    )
+
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Retourne un code de sortie non nul si au moins une non-conformité (FAIL) est détectée.",
+    )
+    parser.add_argument("-v", "--verbose", action="store_true", help="Active les journaux de niveau DEBUG.")
+    return parser
+
+
+def _configure_logging(verbose: bool) -> None:
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+
+
+def _print_summary(result: AnalysisResult) -> None:
+    print("=" * 88)
+    print(
+        f"Synthèse IVSA — PASS={result.pass_count}  FAIL={result.fail_count}  "
+        f"WARNING={result.warning_count}"
+    )
+    print("=" * 88)
+    for check in result.checks:
+        print(f"[{check.status.value:^14}] {check.rule_id:<8} {check.title}")
+        for anomaly in check.anomalies:
+            print(f"    - ({anomaly.severity.value}) {anomaly.description}")
+    print("=" * 88)
+
+
+def run(args: argparse.Namespace) -> AnalysisResult:
+    rules_config = RulesConfig.from_yaml(args.rules)
+    analyzer = PcapAnalyzer(args.pcap)
+
+    logger.info("Extraction des messages SIP depuis %s ...", args.pcap)
+    messages = analyzer.extract_sip_messages()
+    dialogs = analyzer.build_dialogs(messages)
+    flows = analyzer.extract_network_flows(messages)
+    rtp_samples = analyzer.extract_rtp_teardown_samples(dialogs)
+    keepalives = analyzer.extract_keepalives(messages)
+    ancillary_observations = analyzer.detect_ancillary_observations(messages)
+
+    sbc_sip_endpoints = (
+        [NetworkEndpoint(ip=ip, port=5060) for ip in args.sbc_sip_ip] if args.sbc_sip_ip else None
+    )
+    sbc_rtp_endpoints = (
+        [NetworkEndpoint(ip=ip, port=0) for ip in args.sbc_rtp_ip] if args.sbc_rtp_ip else None
+    )
+
+    logger.info("Application du référentiel de règles %s ...", args.rules)
+    engine = RuleEngine(rules_config)
+    checks = engine.run_all(
+        dialogs=dialogs,
+        messages=messages,
+        flows=flows,
+        sbc_sip_endpoints=sbc_sip_endpoints,
+        sbc_rtp_endpoints=sbc_rtp_endpoints,
+        rtp_teardown_samples=rtp_samples,
+        keepalives=keepalives,
+        ancillary_observations=ancillary_observations,
+    )
+
+    metadata = AnalysisMetadata(
+        pcap_filename=Path(args.pcap).name,
+        analyst=args.analyst,
+        client_name=args.client,
+        site_name=args.site,
+        ipbx_vendor=args.ipbx_vendor,
+        ipbx_version=args.ipbx_version,
+        operator=args.operator,
+        trunk_type=args.trunk_type,
+        total_packets_captured=analyzer.total_frame_count(),
+        total_sip_messages=len(messages),
+        total_sip_dialogs=len(dialogs),
+        ruleset_name=rules_config.metadata.ruleset_name,
+        ruleset_version=rules_config.metadata.ruleset_version,
+    )
+    result = AnalysisResult(metadata=metadata, checks=checks)
+
+    if args.ecs_output:
+        logger.info("Export des événements ECS vers %s ...", args.ecs_output)
+        event_count = export_ndjson(result, rules_config.siem_ecs, args.ecs_output)
+        logger.info("%d événement(s) ECS exporté(s).", event_count)
+
+    logger.info("Génération du rapport Word vers %s ...", args.output)
+    builder = ReportBuilder(args.template)
+    builder.render(result, args.output, ruleset_sources=rules_config.metadata.sources)
+    logger.info("Rapport généré avec succès : %s", args.output)
+
+    return result
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+    _configure_logging(args.verbose)
+
+    try:
+        result = run(args)
+    except IvsaError as exc:
+        logger.error(str(exc))
+        return 1
+    except KeyboardInterrupt:
+        logger.warning("Interrompu par l'utilisateur.")
+        return 130
+
+    _print_summary(result)
+
+    if args.strict and result.fail_count > 0:
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

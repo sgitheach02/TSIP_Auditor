@@ -1,0 +1,13 @@
+# IVSA - Ilexia Validation & Security Automator
+# Dépendances d'exécution. Nécessite également le binaire `tshark` (Wireshark
+# CLI) installé sur le système et accessible dans le PATH (paquet système
+# "wireshark-cli" / "tshark" selon la distribution) : Pyshark s'appuie sur ce
+# binaire pour la dissection SIP/SDP.
+
+pyshark>=0.6,<0.7
+scapy>=2.7,<3.0
+pydantic>=2.11,<3.0
+PyYAML>=6.0,<7.0
+python-docx>=1.2,<2.0
+docxtpl>=0.20,<0.21
+Jinja2>=3.1,<4.0

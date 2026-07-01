@@ -1,0 +1,183 @@
+"""Analyseur SDP (RFC 4566) autonome.
+
+Le corps SDP d'un message SIP est extrait sous forme de texte brut (décodage
+des octets bruts capturés par TShark) puis analysé par ce module au moyen
+d'un parseur ligne-à-ligne déterministe, indépendant des dissecteurs internes
+de TShark. Cette approche garantit un comportement stable et testable
+(indépendant de la version de TShark installée) pour un besoin de parsing
+SDP qui reste, par nature, un simple découpage de lignes `type=valeur`.
+"""
+
+from __future__ import annotations
+
+import re
+
+from ivsa.core.models import SdpCodec, SdpMediaDescription
+
+# Table des types de charge utile RTP statiques (RFC 3551 - IANA).
+_STATIC_PAYLOAD_TYPES: dict[int, str] = {
+    0: "PCMU",
+    3: "GSM",
+    4: "G723",
+    5: "DVI4",
+    6: "DVI4",
+    7: "LPC",
+    8: "PCMA",
+    9: "G722",
+    10: "L16",
+    11: "L16",
+    12: "QCELP",
+    13: "CN",
+    14: "MPA",
+    15: "G728",
+    16: "DVI4",
+    17: "DVI4",
+    18: "G729",
+    25: "CelB",
+    26: "JPEG",
+    28: "nv",
+    31: "H261",
+    32: "MPV",
+    33: "MP2T",
+    34: "H263",
+}
+
+_HEX_BYTE_PATTERN = re.compile(r"^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2})*$")
+
+
+def decode_message_body(raw_value: str) -> str:
+    """Décode un corps de message tel que restitué par TShark.
+
+    En mode `include_raw=True`, TShark restitue les champs de type `FT_BYTES`
+    (tel que `sip.msg_body`) sous forme de chaîne hexadécimale séparée par
+    des ':' plutôt que sous forme de texte décodé. Cette fonction détecte ce
+    format et le décode en UTF-8 ; toute autre valeur est retournée telle
+    quelle (cas d'un corps déjà fourni en texte clair).
+    """
+
+    if not raw_value:
+        return ""
+    if _HEX_BYTE_PATTERN.match(raw_value.strip()):
+        try:
+            return bytes.fromhex(raw_value.replace(":", "")).decode("utf-8", errors="replace")
+        except ValueError:
+            return raw_value
+    return raw_value
+
+
+def parse_sdp_body(body_text: str) -> list[SdpMediaDescription]:
+    """Analyse un corps SDP complet et retourne la liste ordonnée des
+    descriptions de média (`m=`) qu'il contient, avec leurs codecs dans
+    l'ordre de négociation d'origine (déterminant pour la conformité STAS).
+    """
+
+    if not body_text.strip():
+        return []
+
+    session_connection_address: str | None = None
+    media_blocks: list[dict] = []
+    current: dict | None = None
+
+    for raw_line in body_text.replace("\r\n", "\n").split("\n"):
+        line = raw_line.strip()
+        if not line or "=" not in line:
+            continue
+        field_type, _, value = line.partition("=")
+
+        if field_type == "m":
+            if current is not None:
+                media_blocks.append(current)
+            tokens = value.split()
+            if len(tokens) < 3:
+                current = None
+                continue
+            current = {
+                "media_type": tokens[0],
+                "port": _safe_int(tokens[1].split("/")[0]),
+                "protocol": tokens[2],
+                "format_tokens": tokens[3:],
+                "attributes": [],
+                "connection_address": None,
+            }
+        elif field_type == "c":
+            address = _parse_connection_address(value)
+            if current is not None:
+                current["connection_address"] = address
+            else:
+                session_connection_address = address
+        elif field_type == "a" and current is not None:
+            current["attributes"].append(value.strip())
+
+    if current is not None:
+        media_blocks.append(current)
+
+    descriptions: list[SdpMediaDescription] = []
+    for block in media_blocks:
+        codecs, ptime_ms, maxptime_ms = _build_codecs(block["format_tokens"], block["attributes"])
+        descriptions.append(
+            SdpMediaDescription(
+                media_type=block["media_type"],
+                port=block["port"] or 0,
+                protocol=block["protocol"],
+                codecs=codecs,
+                ptime_ms=ptime_ms,
+                maxptime_ms=maxptime_ms,
+                connection_address=block["connection_address"] or session_connection_address,
+            )
+        )
+    return descriptions
+
+
+def _parse_connection_address(value: str) -> str | None:
+    # c=<network type> <address type> <connection address>
+    tokens = value.split()
+    if len(tokens) >= 3:
+        return tokens[2].split("/")[0]
+    return None
+
+
+def _build_codecs(
+    format_tokens: list[str], attributes: list[str]
+) -> tuple[list[SdpCodec], int | None, int | None]:
+    rtpmap: dict[str, tuple[str, int | None]] = {}
+    ptime_ms: int | None = None
+    maxptime_ms: int | None = None
+
+    for attribute in attributes:
+        if attribute.lower().startswith("rtpmap:"):
+            remainder = attribute[len("rtpmap:") :]
+            pt_str, _, rest = remainder.partition(" ")
+            name_and_rate = rest.split("/")
+            name = name_and_rate[0].strip()
+            rate = (
+                _safe_int(name_and_rate[1])
+                if len(name_and_rate) > 1
+                else None
+            )
+            rtpmap[pt_str.strip()] = (name, rate)
+        elif attribute.lower().startswith("ptime:"):
+            ptime_ms = _safe_int(attribute.split(":", 1)[1])
+        elif attribute.lower().startswith("maxptime:"):
+            maxptime_ms = _safe_int(attribute.split(":", 1)[1])
+
+    codecs: list[SdpCodec] = []
+    for token in format_tokens:
+        if token.isdigit():
+            payload_type = int(token)
+            if token in rtpmap:
+                name, rate = rtpmap[token]
+            else:
+                name = _STATIC_PAYLOAD_TYPES.get(payload_type, f"PT-{payload_type}")
+                rate = None
+            codecs.append(SdpCodec(payload_type=payload_type, encoding_name=name, clock_rate=rate))
+        else:
+            # Format non numérique (ex : 't38' pour un flux image/udptl).
+            codecs.append(SdpCodec(payload_type=None, encoding_name=token.upper(), clock_rate=None))
+    return codecs, ptime_ms, maxptime_ms
+
+
+def _safe_int(value: str) -> int | None:
+    try:
+        return int(value.strip())
+    except (ValueError, AttributeError):
+        return None
